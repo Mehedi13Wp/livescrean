@@ -22,7 +22,9 @@ import androidx.core.content.ContextCompat;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -100,11 +102,37 @@ public class MainActivity extends AppCompatActivity {
                     }
             );
 
-    private final ActivityResultLauncher<String>
-            notificationPermissionLauncher =
+    private final ActivityResultLauncher<String[]>
+            permissionsLauncher =
             registerForActivityResult(
-                    new ActivityResultContracts.RequestPermission(),
-                    granted -> requestScreenCapture()
+                    new ActivityResultContracts.RequestMultiplePermissions(),
+                    result -> {
+
+                        boolean audioGranted =
+                                Boolean.TRUE.equals(
+                                        result.get(
+                                                Manifest.permission.RECORD_AUDIO
+                                        )
+                                )
+                                ||
+                                ContextCompat.checkSelfPermission(
+                                        this,
+                                        Manifest.permission.RECORD_AUDIO
+                                ) == PackageManager.PERMISSION_GRANTED;
+
+                        if (!audioGranted) {
+
+                            setLocalStatus(
+                                    "Audio permission required"
+                            );
+
+                            startButton.setEnabled(true);
+
+                            return;
+                        }
+
+                        requestScreenCapture();
+                    }
             );
 
     @Override
@@ -492,8 +520,23 @@ public class MainActivity extends AppCompatActivity {
         startButton.setEnabled(false);
 
         setLocalStatus(
-                "Requesting permission..."
+                "Requesting audio permission..."
         );
+
+        ArrayList<String> permissions =
+                new ArrayList<>();
+
+        if (
+                ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.RECORD_AUDIO
+                ) != PackageManager.PERMISSION_GRANTED
+        ) {
+
+            permissions.add(
+                    Manifest.permission.RECORD_AUDIO
+            );
+        }
 
         if (
                 Build.VERSION.SDK_INT >= 33
@@ -504,8 +547,17 @@ public class MainActivity extends AppCompatActivity {
                 ) != PackageManager.PERMISSION_GRANTED
         ) {
 
-            notificationPermissionLauncher.launch(
+            permissions.add(
                     Manifest.permission.POST_NOTIFICATIONS
+            );
+        }
+
+        if (!permissions.isEmpty()) {
+
+            permissionsLauncher.launch(
+                    permissions.toArray(
+                            new String[0]
+                    )
             );
 
             return;
@@ -515,6 +567,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void requestScreenCapture() {
+
+        setLocalStatus(
+                "Requesting screen capture..."
+        );
 
         Intent captureIntent =
                 projectionManager
@@ -531,7 +587,7 @@ public class MainActivity extends AppCompatActivity {
     ) {
 
         setLocalStatus(
-                "Starting screen service..."
+                "Starting screen + audio service..."
         );
 
         Intent serviceIntent =

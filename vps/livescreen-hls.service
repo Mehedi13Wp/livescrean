@@ -1,0 +1,40 @@
+[Unit]
+Description=LiveScreen HLS Receiver with Audio
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+
+ExecStartPre=/usr/bin/mkdir -p /var/www/rtc/hls
+
+ExecStart=/usr/bin/ffmpeg \
+-hide_banner \
+-loglevel warning \
+-fflags +genpts \
+-f h264 \
+-r 15 \
+-listen 1 \
+-i tcp://0.0.0.0:5000 \
+-f aac \
+-listen 1 \
+-i tcp://0.0.0.0:5001 \
+-map 0:v:0 \
+-map 1:a:0 \
+-c:v copy \
+-c:a copy \
+-f hls \
+-hls_time 1 \
+-hls_list_size 8 \
+-hls_delete_threshold 4 \
+-hls_start_number_source epoch \
+-hls_flags delete_segments+omit_endlist+independent_segments \
+/var/www/rtc/hls/live.m3u8
+
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

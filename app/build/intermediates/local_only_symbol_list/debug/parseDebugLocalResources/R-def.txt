@@ -1,0 +1,9 @@
+R_DEF: Internal format may change without notice
+local
+id startButton
+id statusText
+id stopButton
+id titleText
+layout activity_main
+string app_name
+style Theme.LiveScreen

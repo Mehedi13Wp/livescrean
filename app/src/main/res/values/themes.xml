@@ -1,0 +1,7 @@
+<resources>
+
+    <style name="Theme.LiveScreen" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+
+</resources>

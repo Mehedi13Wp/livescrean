@@ -1,0 +1,22 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.sarahmatches.livescreen'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.sarahmatches.livescreen"
+        minSdk 24
+        targetSdk 36
+        versionCode 2
+        versionName "1.1"
+    }
+}
+
+dependencies {
+    implementation 'io.github.webrtc-sdk:android:137.7151.05'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+}

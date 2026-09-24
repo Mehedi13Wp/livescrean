@@ -1031,7 +1031,7 @@ public class ScreenCaptureService extends Service {
         int channelConfig = AUDIO_CHANNELS;
 
         packet[0] = (byte) 0xFF;
-        packet[1] = (byte) 0xF9;
+        packet[1] = (byte) 0xF1;
         packet[2] =
                 (byte) (
                         ((profile - 1) << 6)

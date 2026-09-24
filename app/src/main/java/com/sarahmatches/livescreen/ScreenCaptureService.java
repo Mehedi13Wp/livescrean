@@ -8,9 +8,14 @@ import android.content.Context;
 import android.content.Intent;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioPlaybackCaptureConfiguration;
+import android.media.AudioRecord;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
+import android.media.MediaRecorder;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
@@ -56,8 +61,11 @@ public class ScreenCaptureService extends Service {
     private static final String VPS_HOST =
             "192.99.144.179";
 
-    private static final int VPS_PORT =
+    private static final int VIDEO_PORT =
             5000;
+
+    private static final int AUDIO_PORT =
+            5001;
 
     private static final int CONNECT_TIMEOUT_MS =
             8000;
@@ -74,6 +82,13 @@ public class ScreenCaptureService extends Service {
     private static final int BITRATE = 1_500_000;
     private static final int I_FRAME_INTERVAL = 1;
 
+    /*
+     * Audio settings
+     */
+    private static final int AUDIO_SAMPLE_RATE = 44100;
+    private static final int AUDIO_CHANNELS = 2;
+    private static final int AUDIO_BITRATE = 128000;
+
     private MediaProjection mediaProjection;
     private VirtualDisplay virtualDisplay;
 
@@ -83,12 +98,20 @@ public class ScreenCaptureService extends Service {
     private HandlerThread encoderThread;
     private Handler encoderHandler;
 
-    private Socket socket;
-    private OutputStream socketOutput;
+    private Socket videoSocket;
+    private OutputStream videoOutput;
+
+    private Thread audioThread;
+    private AudioRecord audioRecord;
+    private MediaCodec audioEncoder;
+
+    private Socket audioSocket;
+    private OutputStream audioOutput;
 
     private volatile boolean running = false;
     private volatile boolean stopping = false;
-    private volatile boolean socketConnected = false;
+    private volatile boolean videoSocketConnected = false;
+    private volatile boolean audioSocketConnected = false;
 
     private long frameCount = 0;
 
@@ -237,16 +260,12 @@ public class ScreenCaptureService extends Service {
 
                     try {
 
-                        /*
-                         * Keep trying VPS until
-                         * connected or user presses STOP.
-                         */
-                        if (!connectToVpsWithRetry()) {
+                        if (!connectVideoWithRetry()) {
 
                             if (!stopping) {
 
                                 updateStatus(
-                                        "VPS connection stopped"
+                                        "VPS video connection stopped"
                                 );
                             }
 
@@ -262,25 +281,23 @@ public class ScreenCaptureService extends Service {
                         }
 
                         updateStatus(
-                                "VPS connected"
+                                "VPS video connected"
                         );
 
-                        prepareEncoder();
-
-                        updateStatus(
-                                "H264 encoder started"
-                        );
+                        prepareVideoEncoder();
 
                         prepareMediaProjection(
                                 resultCode,
                                 captureData
                         );
 
+                        startAudioPipeline();
+
                         updateStatus(
-                                "LIVE: sending to VPS"
+                                "LIVE: video + audio starting"
                         );
 
-                        drainEncoder();
+                        drainVideoEncoder();
 
                     } catch (Exception e) {
 
@@ -308,13 +325,7 @@ public class ScreenCaptureService extends Service {
         );
     }
 
-    /*
-     * Initial VPS connection.
-     *
-     * It keeps retrying instead of stopping
-     * the entire screen-share service.
-     */
-    private boolean connectToVpsWithRetry() {
+    private boolean connectVideoWithRetry() {
 
         int attempt = 0;
 
@@ -329,18 +340,18 @@ public class ScreenCaptureService extends Service {
             try {
 
                 updateStatus(
-                        "Connecting VPS... "
+                        "Connecting video VPS... "
                                 +
                                 attempt
                 );
 
-                connectToVps();
+                connectVideoSocket();
 
                 return true;
 
             } catch (IOException e) {
 
-                closeSocket();
+                closeVideoSocket();
 
                 if (
                         !running
@@ -349,10 +360,6 @@ public class ScreenCaptureService extends Service {
                 ) {
                     return false;
                 }
-
-                updateStatus(
-                        "VPS unavailable - retrying..."
-                );
 
                 if (!waitBeforeReconnect()) {
                     return false;
@@ -363,10 +370,10 @@ public class ScreenCaptureService extends Service {
         return false;
     }
 
-    private void connectToVps()
+    private void connectVideoSocket()
             throws IOException {
 
-        closeSocket();
+        closeVideoSocket();
 
         Socket newSocket =
                 new Socket();
@@ -382,7 +389,7 @@ public class ScreenCaptureService extends Service {
         newSocket.connect(
                 new InetSocketAddress(
                         VPS_HOST,
-                        VPS_PORT
+                        VIDEO_PORT
                 ),
                 CONNECT_TIMEOUT_MS
         );
@@ -393,23 +400,19 @@ public class ScreenCaptureService extends Service {
                         256 * 1024
                 );
 
-        socket =
+        videoSocket =
                 newSocket;
 
-        socketOutput =
+        videoOutput =
                 newOutput;
 
-        socketConnected =
+        videoSocketConnected =
                 true;
     }
 
-    /*
-     * Called whenever TCP connection breaks
-     * while screen capture is still running.
-     */
-    private boolean reconnectToVps() {
+    private boolean reconnectVideo() {
 
-        closeSocket();
+        closeVideoSocket();
 
         int attempt = 0;
 
@@ -422,36 +425,28 @@ public class ScreenCaptureService extends Service {
             attempt++;
 
             updateStatus(
-                    "Reconnecting VPS... "
+                    "Reconnecting video... "
                             +
                             attempt
             );
 
             try {
 
-                connectToVps();
+                connectVideoSocket();
 
-                /*
-                 * New TCP connection needs
-                 * SPS/PPS again.
-                 */
                 sendCachedCodecSpecificData();
 
-                /*
-                 * Request a fresh keyframe so
-                 * FFmpeg can immediately resume.
-                 */
                 requestKeyFrame();
 
                 updateStatus(
-                        "VPS reconnected ✓"
+                        "Video reconnected ✓"
                 );
 
                 return true;
 
             } catch (Exception e) {
 
-                closeSocket();
+                closeVideoSocket();
 
                 if (
                         !running
@@ -461,10 +456,6 @@ public class ScreenCaptureService extends Service {
 
                     return false;
                 }
-
-                updateStatus(
-                        "Reconnect failed - retrying..."
-                );
 
                 if (!waitBeforeReconnect()) {
 
@@ -496,7 +487,7 @@ public class ScreenCaptureService extends Service {
             try {
 
                 Thread.sleep(
-                        250
+                        200
                 );
 
             } catch (InterruptedException e) {
@@ -513,7 +504,7 @@ public class ScreenCaptureService extends Service {
                 !stopping;
     }
 
-    private void prepareEncoder()
+    private void prepareVideoEncoder()
             throws IOException {
 
         MediaFormat format =
@@ -641,7 +632,561 @@ public class ScreenCaptureService extends Service {
         }
     }
 
-    private void drainEncoder() {
+    private void startAudioPipeline() {
+
+        audioThread =
+                new Thread(
+                        this::runAudioPipeline,
+                        "LiveScreenAudio"
+                );
+
+        audioThread.start();
+    }
+
+    private void runAudioPipeline() {
+
+        try {
+
+            audioRecord =
+                    createAudioRecord();
+
+            if (
+                    audioRecord == null
+                            ||
+                    audioRecord.getState()
+                            !=
+                    AudioRecord.STATE_INITIALIZED
+            ) {
+
+                updateStatus(
+                        "Video live; audio unavailable"
+                );
+
+                return;
+            }
+
+            MediaFormat audioFormat =
+                    MediaFormat.createAudioFormat(
+                            MediaFormat.MIMETYPE_AUDIO_AAC,
+                            AUDIO_SAMPLE_RATE,
+                            AUDIO_CHANNELS
+                    );
+
+            audioFormat.setInteger(
+                    MediaFormat.KEY_AAC_PROFILE,
+                    MediaCodecInfo.CodecProfileLevel.AACObjectLC
+            );
+
+            audioFormat.setInteger(
+                    MediaFormat.KEY_BIT_RATE,
+                    AUDIO_BITRATE
+            );
+
+            audioFormat.setInteger(
+                    MediaFormat.KEY_MAX_INPUT_SIZE,
+                    16384
+            );
+
+            audioEncoder =
+                    MediaCodec.createEncoderByType(
+                            MediaFormat.MIMETYPE_AUDIO_AAC
+                    );
+
+            audioEncoder.configure(
+                    audioFormat,
+                    null,
+                    null,
+                    MediaCodec.CONFIGURE_FLAG_ENCODE
+            );
+
+            audioEncoder.start();
+
+            audioRecord.startRecording();
+
+            connectAudioWithRetry();
+
+            byte[] pcm =
+                    new byte[8192];
+
+            MediaCodec.BufferInfo info =
+                    new MediaCodec.BufferInfo();
+
+            while (
+                    running
+                            &&
+                    !stopping
+            ) {
+
+                int read =
+                        audioRecord.read(
+                                pcm,
+                                0,
+                                pcm.length
+                        );
+
+                if (read > 0) {
+
+                    int inputIndex =
+                            audioEncoder.dequeueInputBuffer(
+                                    10000
+                            );
+
+                    if (inputIndex >= 0) {
+
+                        ByteBuffer input =
+                                audioEncoder.getInputBuffer(
+                                        inputIndex
+                                );
+
+                        if (input != null) {
+
+                            input.clear();
+                            input.put(
+                                    pcm,
+                                    0,
+                                    read
+                            );
+
+                            long pts =
+                                    System.nanoTime()
+                                            /
+                                    1000L;
+
+                            audioEncoder.queueInputBuffer(
+                                    inputIndex,
+                                    0,
+                                    read,
+                                    pts,
+                                    0
+                            );
+                        }
+                    }
+                }
+
+                drainAudioEncoder(
+                        info
+                );
+            }
+
+        } catch (Exception e) {
+
+            if (
+                    running
+                            &&
+                    !stopping
+            ) {
+
+                updateStatus(
+                        "Video live; audio error: "
+                                +
+                                e.getClass()
+                                        .getSimpleName()
+                );
+            }
+
+        } finally {
+
+            releaseAudio();
+        }
+    }
+
+    private AudioRecord createAudioRecord() {
+
+        int channelMask =
+                AudioFormat.CHANNEL_IN_STEREO;
+
+        int minBuffer =
+                AudioRecord.getMinBufferSize(
+                        AUDIO_SAMPLE_RATE,
+                        channelMask,
+                        AudioFormat.ENCODING_PCM_16BIT
+                );
+
+        int bufferSize =
+                Math.max(
+                        minBuffer * 2,
+                        16384
+                );
+
+        if (
+                Build.VERSION.SDK_INT
+                        >=
+                Build.VERSION_CODES.Q
+                        &&
+                mediaProjection != null
+        ) {
+
+            try {
+
+                AudioPlaybackCaptureConfiguration config =
+                        new AudioPlaybackCaptureConfiguration
+                                .Builder(
+                                        mediaProjection
+                                )
+                                .addMatchingUsage(
+                                        AudioAttributes.USAGE_MEDIA
+                                )
+                                .addMatchingUsage(
+                                        AudioAttributes.USAGE_GAME
+                                )
+                                .build();
+
+                AudioFormat format =
+                        new AudioFormat
+                                .Builder()
+                                .setEncoding(
+                                        AudioFormat.ENCODING_PCM_16BIT
+                                )
+                                .setSampleRate(
+                                        AUDIO_SAMPLE_RATE
+                                )
+                                .setChannelMask(
+                                        channelMask
+                                )
+                                .build();
+
+                AudioRecord playbackRecord =
+                        new AudioRecord
+                                .Builder()
+                                .setAudioFormat(
+                                        format
+                                )
+                                .setBufferSizeInBytes(
+                                        bufferSize
+                                )
+                                .setAudioPlaybackCaptureConfig(
+                                        config
+                                )
+                                .build();
+
+                if (
+                        playbackRecord.getState()
+                                ==
+                        AudioRecord.STATE_INITIALIZED
+                ) {
+
+                    updateStatus(
+                            "Audio: internal playback capture"
+                    );
+
+                    return playbackRecord;
+                }
+
+                playbackRecord.release();
+
+            } catch (Exception ignored) {
+            }
+        }
+
+        try {
+
+            AudioRecord micRecord =
+                    new AudioRecord(
+                            MediaRecorder.AudioSource.MIC,
+                            AUDIO_SAMPLE_RATE,
+                            channelMask,
+                            AudioFormat.ENCODING_PCM_16BIT,
+                            bufferSize
+                    );
+
+            if (
+                    micRecord.getState()
+                            ==
+                    AudioRecord.STATE_INITIALIZED
+            ) {
+
+                updateStatus(
+                        "Audio: microphone fallback"
+                );
+
+                return micRecord;
+            }
+
+            micRecord.release();
+
+        } catch (Exception ignored) {
+        }
+
+        return null;
+    }
+
+    private void drainAudioEncoder(
+            MediaCodec.BufferInfo info
+    ) throws IOException {
+
+        while (
+                running
+                        &&
+                !stopping
+                        &&
+                audioEncoder != null
+        ) {
+
+            int outputIndex =
+                    audioEncoder.dequeueOutputBuffer(
+                            info,
+                            0
+                    );
+
+            if (
+                    outputIndex
+                            ==
+                    MediaCodec.INFO_TRY_AGAIN_LATER
+            ) {
+
+                return;
+            }
+
+            if (
+                    outputIndex
+                            ==
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED
+            ) {
+
+                continue;
+            }
+
+            if (outputIndex < 0) {
+
+                return;
+            }
+
+            try {
+
+                ByteBuffer output =
+                        audioEncoder.getOutputBuffer(
+                                outputIndex
+                        );
+
+                if (
+                        output == null
+                                ||
+                        info.size <= 0
+                ) {
+
+                    continue;
+                }
+
+                if (
+                        (
+                                info.flags
+                                        &
+                                MediaCodec.BUFFER_FLAG_CODEC_CONFIG
+                        )
+                                != 0
+                ) {
+
+                    continue;
+                }
+
+                output.position(
+                        info.offset
+                );
+
+                output.limit(
+                        info.offset
+                                +
+                                info.size
+                );
+
+                byte[] aac =
+                        new byte[
+                                info.size
+                                +
+                                7
+                                ];
+
+                addAdtsHeader(
+                        aac,
+                        aac.length
+                );
+
+                output.get(
+                        aac,
+                        7,
+                        info.size
+                );
+
+                sendAudioData(
+                        aac
+                );
+
+            } finally {
+
+                audioEncoder.releaseOutputBuffer(
+                        outputIndex,
+                        false
+                );
+            }
+        }
+    }
+
+    private void addAdtsHeader(
+            byte[] packet,
+            int packetLength
+    ) {
+
+        int profile = 2;
+        int frequencyIndex = 4;
+        int channelConfig = AUDIO_CHANNELS;
+
+        packet[0] = (byte) 0xFF;
+        packet[1] = (byte) 0xF9;
+        packet[2] =
+                (byte) (
+                        ((profile - 1) << 6)
+                                |
+                        (frequencyIndex << 2)
+                                |
+                        (channelConfig >> 2)
+                );
+
+        packet[3] =
+                (byte) (
+                        ((channelConfig & 3) << 6)
+                                |
+                        (packetLength >> 11)
+                );
+
+        packet[4] =
+                (byte) (
+                        (packetLength & 0x7FF)
+                                >>
+                        3
+                );
+
+        packet[5] =
+                (byte) (
+                        (
+                                (packetLength & 7)
+                                        <<
+                                5
+                        )
+                                |
+                        0x1F
+                );
+
+        packet[6] =
+                (byte) 0xFC;
+    }
+
+    private void connectAudioWithRetry() {
+
+        while (
+                running
+                        &&
+                !stopping
+                        &&
+                !audioSocketConnected
+        ) {
+
+            try {
+
+                connectAudioSocket();
+
+                updateStatus(
+                        "LIVE: video + audio connected"
+                );
+
+                return;
+
+            } catch (IOException e) {
+
+                closeAudioSocket();
+
+                if (!waitBeforeReconnect()) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private void connectAudioSocket()
+            throws IOException {
+
+        closeAudioSocket();
+
+        Socket newSocket =
+                new Socket();
+
+        newSocket.setTcpNoDelay(
+                true
+        );
+
+        newSocket.setKeepAlive(
+                true
+        );
+
+        newSocket.connect(
+                new InetSocketAddress(
+                        VPS_HOST,
+                        AUDIO_PORT
+                ),
+                CONNECT_TIMEOUT_MS
+        );
+
+        OutputStream newOutput =
+                new BufferedOutputStream(
+                        newSocket.getOutputStream(),
+                        128 * 1024
+                );
+
+        audioSocket =
+                newSocket;
+
+        audioOutput =
+                newOutput;
+
+        audioSocketConnected =
+                true;
+    }
+
+    private void sendAudioData(
+            byte[] data
+    ) {
+
+        if (
+                !running
+                        ||
+                stopping
+        ) {
+
+            return;
+        }
+
+        try {
+
+            if (
+                    !audioSocketConnected
+                            ||
+                    audioOutput == null
+            ) {
+
+                connectAudioWithRetry();
+            }
+
+            if (
+                    audioSocketConnected
+                            &&
+                    audioOutput != null
+            ) {
+
+                audioOutput.write(
+                        data
+                );
+
+                audioOutput.flush();
+            }
+
+        } catch (IOException e) {
+
+            closeAudioSocket();
+
+            connectAudioWithRetry();
+        }
+    }
+
+    private void drainVideoEncoder() {
 
         MediaCodec.BufferInfo info =
                 new MediaCodec.BufferInfo();
@@ -697,7 +1242,7 @@ public class ScreenCaptureService extends Service {
 
                     } catch (IOException e) {
 
-                        if (!reconnectToVps()) {
+                        if (!reconnectVideo()) {
                             return;
                         }
                     }
@@ -745,7 +1290,7 @@ public class ScreenCaptureService extends Service {
 
                     try {
 
-                        sendEncodedData(
+                        sendVideoData(
                                 data
                         );
 
@@ -754,18 +1299,7 @@ public class ScreenCaptureService extends Service {
 
                     } catch (IOException e) {
 
-                        if (
-                                running
-                                        &&
-                                !stopping
-                        ) {
-
-                            updateStatus(
-                                    "Connection lost - reconnecting..."
-                            );
-                        }
-
-                        if (!reconnectToVps()) {
+                        if (!reconnectVideo()) {
 
                             return;
                         }
@@ -787,7 +1321,11 @@ public class ScreenCaptureService extends Service {
                         if (keyFrame) {
 
                             updateStatus(
-                                    "LIVE ✓ keyframe sent"
+                                    audioSocketConnected
+                                            ?
+                                            "LIVE ✓ video + audio"
+                                            :
+                                            "LIVE ✓ video; audio reconnecting"
                             );
 
                         } else if (
@@ -795,9 +1333,11 @@ public class ScreenCaptureService extends Service {
                         ) {
 
                             updateStatus(
-                                    "LIVE ✓ frames: "
-                                            +
-                                            frameCount
+                                    audioSocketConnected
+                                            ?
+                                            "LIVE ✓ video + audio"
+                                            :
+                                            "LIVE ✓ video"
                             );
                         }
                     }
@@ -812,7 +1352,7 @@ public class ScreenCaptureService extends Service {
                 ) {
 
                     updateStatus(
-                            "Encoder error: "
+                            "Video encoder error: "
                                     +
                                     e.getClass()
                                             .getSimpleName()
@@ -900,7 +1440,7 @@ public class ScreenCaptureService extends Service {
                         cachedCsd0.length > 0
         ) {
 
-            sendEncodedData(
+            sendVideoData(
                     cachedCsd0
             );
         }
@@ -911,14 +1451,14 @@ public class ScreenCaptureService extends Service {
                         cachedCsd1.length > 0
         ) {
 
-            sendEncodedData(
+            sendVideoData(
                     cachedCsd1
             );
         }
 
-        if (socketOutput != null) {
+        if (videoOutput != null) {
 
-            socketOutput.flush();
+            videoOutput.flush();
         }
     }
 
@@ -946,66 +1486,102 @@ public class ScreenCaptureService extends Service {
         }
     }
 
-    private void sendEncodedData(
+    private void sendVideoData(
             byte[] data
     ) throws IOException {
 
         if (
-                !socketConnected
+                !videoSocketConnected
                         ||
-                socketOutput == null
+                videoOutput == null
         ) {
 
             throw new IOException(
-                    "VPS socket disconnected"
+                    "VPS video socket disconnected"
             );
         }
 
-        socketOutput.write(
+        videoOutput.write(
                 data
         );
 
-        /*
-         * Frequent flush keeps latency low.
-         */
-        socketOutput.flush();
+        videoOutput.flush();
     }
 
-    private synchronized void closeSocket() {
+    private synchronized void closeVideoSocket() {
 
-        socketConnected =
+        videoSocketConnected =
                 false;
 
-        if (socketOutput != null) {
+        if (videoOutput != null) {
 
             try {
 
-                socketOutput.flush();
+                videoOutput.flush();
 
             } catch (Exception ignored) {
             }
 
             try {
 
-                socketOutput.close();
+                videoOutput.close();
 
             } catch (Exception ignored) {
             }
 
-            socketOutput =
+            videoOutput =
                     null;
         }
 
-        if (socket != null) {
+        if (videoSocket != null) {
 
             try {
 
-                socket.close();
+                videoSocket.close();
 
             } catch (Exception ignored) {
             }
 
-            socket =
+            videoSocket =
+                    null;
+        }
+    }
+
+    private synchronized void closeAudioSocket() {
+
+        audioSocketConnected =
+                false;
+
+        if (audioOutput != null) {
+
+            try {
+
+                audioOutput.flush();
+
+            } catch (Exception ignored) {
+            }
+
+            try {
+
+                audioOutput.close();
+
+            } catch (Exception ignored) {
+            }
+
+            audioOutput =
+                    null;
+        }
+
+        if (audioSocket != null) {
+
+            try {
+
+                audioSocket.close();
+
+            } catch (Exception ignored) {
+            }
+
+            audioSocket =
                     null;
         }
     }
@@ -1026,11 +1602,28 @@ public class ScreenCaptureService extends Service {
                 "Stopping..."
         );
 
-        /*
-         * Closing socket also interrupts
-         * active network writes.
-         */
-        closeSocket();
+        closeVideoSocket();
+        closeAudioSocket();
+
+        if (audioRecord != null) {
+
+            try {
+
+                audioRecord.stop();
+
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (audioThread != null) {
+
+            try {
+
+                audioThread.interrupt();
+
+            } catch (Exception ignored) {
+            }
+        }
 
         if (encoderHandler != null) {
 
@@ -1044,9 +1637,58 @@ public class ScreenCaptureService extends Service {
         }
     }
 
+    private void releaseAudio() {
+
+        closeAudioSocket();
+
+        if (audioRecord != null) {
+
+            try {
+
+                audioRecord.stop();
+
+            } catch (Exception ignored) {
+            }
+
+            try {
+
+                audioRecord.release();
+
+            } catch (Exception ignored) {
+            }
+
+            audioRecord =
+                    null;
+        }
+
+        if (audioEncoder != null) {
+
+            try {
+
+                audioEncoder.stop();
+
+            } catch (Exception ignored) {
+            }
+
+            try {
+
+                audioEncoder.release();
+
+            } catch (Exception ignored) {
+            }
+
+            audioEncoder =
+                    null;
+        }
+
+        audioThread =
+                null;
+    }
+
     private void releaseEverything() {
 
-        closeSocket();
+        closeVideoSocket();
+        closeAudioSocket();
 
         if (virtualDisplay != null) {
 

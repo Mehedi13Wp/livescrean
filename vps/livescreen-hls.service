@@ -13,24 +13,38 @@ ExecStartPre=/usr/bin/mkdir -p /var/www/rtc/hls
 ExecStart=/usr/bin/ffmpeg \
 -hide_banner \
 -loglevel warning \
--fflags +genpts \
+-thread_queue_size 1024 \
+-use_wallclock_as_timestamps 1 \
 -f h264 \
 -r 15 \
 -listen 1 \
 -i tcp://0.0.0.0:5000 \
+-thread_queue_size 1024 \
+-use_wallclock_as_timestamps 1 \
 -f aac \
 -listen 1 \
 -i tcp://0.0.0.0:5001 \
 -map 0:v:0 \
 -map 1:a:0 \
--c:v copy \
--c:a copy \
+-c:v libx264 \
+-preset veryfast \
+-tune zerolatency \
+-pix_fmt yuv420p \
+-r 15 \
+-g 30 \
+-keyint_min 30 \
+-sc_threshold 0 \
+-c:a aac \
+-b:a 128k \
+-ar 44100 \
+-ac 2 \
+-af aresample=async=1:first_pts=0 \
 -f hls \
--hls_time 1 \
--hls_list_size 8 \
--hls_delete_threshold 4 \
+-hls_time 2 \
+-hls_list_size 6 \
+-hls_delete_threshold 3 \
 -hls_start_number_source epoch \
--hls_flags delete_segments+omit_endlist+independent_segments \
+-hls_flags delete_segments+omit_endlist+independent_segments+program_date_time \
 /var/www/rtc/hls/live.m3u8
 
 Restart=always

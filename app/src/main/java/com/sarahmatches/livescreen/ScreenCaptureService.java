@@ -23,6 +23,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.view.Surface;
 
@@ -38,65 +39,41 @@ import java.nio.ByteBuffer;
 
 public class ScreenCaptureService extends Service {
 
-    public static final String ACTION_START =
-            "com.sarahmatches.livescreen.START";
+    public static final String ACTION_START = "com.sarahmatches.livescreen.START";
+    public static final String ACTION_STOP = "com.sarahmatches.livescreen.STOP";
+    public static final String EXTRA_RESULT_CODE = "result_code";
+    public static final String EXTRA_CAPTURE_DATA = "capture_data";
 
-    public static final String ACTION_STOP =
-            "com.sarahmatches.livescreen.STOP";
-
-    public static final String EXTRA_RESULT_CODE =
-            "result_code";
-
-    public static final String EXTRA_CAPTURE_DATA =
-            "capture_data";
-
-    private static final String CHANNEL_ID =
-            "screen_capture_channel";
-
+    private static final String CHANNEL_ID = "screen_capture_channel";
     private static final int NOTIFICATION_ID = 1001;
 
-    /*
-     * VPS settings
-     */
-    private static final String VPS_HOST =
-            "192.99.144.179";
+    private static final String VPS_HOST = "192.99.144.179";
+    private static final int VIDEO_PORT = 5000;
+    private static final int AUDIO_PORT = 5001;
 
-    private static final int VIDEO_PORT =
-            5000;
+    private static final int CONNECT_TIMEOUT_MS = 8000;
+    private static final int RECONNECT_DELAY_MS = 1200;
+    private static final int VIDEO_STALL_TIMEOUT_MS = 12000;
+    private static final int WATCHDOG_INTERVAL_MS = 4000;
 
-    private static final int AUDIO_PORT =
-            5001;
-
-    private static final int CONNECT_TIMEOUT_MS =
-            8000;
-
-    private static final int RECONNECT_DELAY_MS =
-            800;
-
-    /*
-     * Video settings
-     */
     private static final int WIDTH = 540;
     private static final int HEIGHT = 960;
     private static final int FPS = 15;
     private static final int BITRATE = 1_500_000;
     private static final int I_FRAME_INTERVAL = 1;
 
-    /*
-     * Audio settings
-     */
     private static final int AUDIO_SAMPLE_RATE = 44100;
     private static final int AUDIO_CHANNELS = 2;
     private static final int AUDIO_BITRATE = 128000;
 
     private MediaProjection mediaProjection;
     private VirtualDisplay virtualDisplay;
-
-    private MediaCodec encoder;
+    private MediaCodec videoEncoder;
     private Surface encoderInputSurface;
 
     private HandlerThread encoderThread;
     private Handler encoderHandler;
+    private Handler watchdogHandler;
 
     private Socket videoSocket;
     private OutputStream videoOutput;
@@ -104,260 +81,191 @@ public class ScreenCaptureService extends Service {
     private Thread audioThread;
     private AudioRecord audioRecord;
     private MediaCodec audioEncoder;
-
     private Socket audioSocket;
     private OutputStream audioOutput;
+
+    private PowerManager.WakeLock wakeLock;
 
     private volatile boolean running = false;
     private volatile boolean stopping = false;
     private volatile boolean videoSocketConnected = false;
     private volatile boolean audioSocketConnected = false;
 
-    private long frameCount = 0;
+    private volatile long lastVideoWriteAt = 0L;
+    private volatile long lastVideoFrameAt = 0L;
+    private volatile long lastAudioWriteAt = 0L;
 
-    /*
-     * Saved H264 SPS/PPS.
-     *
-     * These are sent again after reconnect
-     * so FFmpeg can decode a new connection.
-     */
+    private long frameCount = 0L;
+
     private byte[] cachedCsd0;
     private byte[] cachedCsd1;
 
     @Override
     public void onCreate() {
-
         super.onCreate();
-
         createNotificationChannel();
+        acquireWakeLock();
 
         startForeground(
                 NOTIFICATION_ID,
-                buildNotification(
-                        "Service ready"
-                )
+                buildNotification("Service ready")
         );
 
-        updateStatus(
-                "Service ready"
-        );
+        updateStatus("Service ready");
     }
 
     @Override
-    public int onStartCommand(
-            Intent intent,
-            int flags,
-            int startId
-    ) {
+    public int onStartCommand(Intent intent, int flags, int startId) {
 
         if (intent == null) {
             return START_NOT_STICKY;
         }
 
-        String action =
-                intent.getAction();
+        String action = intent.getAction();
 
         if (ACTION_STOP.equals(action)) {
-
             stopStreaming();
-
             return START_NOT_STICKY;
         }
 
         if (!ACTION_START.equals(action)) {
-
             return START_NOT_STICKY;
         }
 
         if (running) {
-
-            updateStatus(
-                    "Already streaming"
-            );
-
+            updateStatus("Already streaming");
             return START_NOT_STICKY;
         }
 
-        int resultCode =
-                intent.getIntExtra(
-                        EXTRA_RESULT_CODE,
-                        0
-                );
+        int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
+        Intent captureData = getCaptureIntent(intent);
 
-        Intent captureData =
-                getCaptureIntent(intent);
-
-        if (
-                resultCode == 0
-                        ||
-                captureData == null
-        ) {
-
-            updateStatus(
-                    "Capture permission missing"
-            );
-
+        if (resultCode == 0 || captureData == null) {
+            updateStatus("Capture permission missing");
             stopSelf();
-
             return START_NOT_STICKY;
         }
 
-        startStreaming(
-                resultCode,
-                captureData
-        );
-
+        startStreaming(resultCode, captureData);
         return START_NOT_STICKY;
     }
 
     @SuppressWarnings("deprecation")
-    private Intent getCaptureIntent(
-            Intent serviceIntent
-    ) {
-
+    private Intent getCaptureIntent(Intent serviceIntent) {
         if (Build.VERSION.SDK_INT >= 33) {
-
-            return serviceIntent
-                    .getParcelableExtra(
-                            EXTRA_CAPTURE_DATA,
-                            Intent.class
-                    );
+            return serviceIntent.getParcelableExtra(EXTRA_CAPTURE_DATA, Intent.class);
         }
 
-        return serviceIntent
-                .getParcelableExtra(
-                        EXTRA_CAPTURE_DATA
-                );
+        return serviceIntent.getParcelableExtra(EXTRA_CAPTURE_DATA);
     }
 
-    private void startStreaming(
-            int resultCode,
-            Intent captureData
-    ) {
+    private void startStreaming(int resultCode, Intent captureData) {
 
         running = true;
         stopping = false;
-
-        frameCount = 0;
+        frameCount = 0L;
 
         cachedCsd0 = null;
         cachedCsd1 = null;
 
-        encoderThread =
-                new HandlerThread(
-                        "LiveScreenEncoder"
-                );
+        long now = SystemClock.elapsedRealtime();
+        lastVideoWriteAt = now;
+        lastVideoFrameAt = now;
+        lastAudioWriteAt = now;
 
+        encoderThread = new HandlerThread("LiveScreenEncoder");
         encoderThread.start();
 
-        encoderHandler =
-                new Handler(
-                        encoderThread.getLooper()
+        encoderHandler = new Handler(encoderThread.getLooper());
+        watchdogHandler = new Handler(encoderThread.getLooper());
+
+        encoderHandler.post(() -> {
+            try {
+                if (!connectVideoWithRetry()) {
+                    if (!stopping) {
+                        updateStatus("VPS video connection stopped");
+                    }
+                    return;
+                }
+
+                if (!running || stopping) {
+                    return;
+                }
+
+                updateStatus("VPS video connected");
+
+                prepareVideoEncoder();
+                prepareMediaProjection(resultCode, captureData);
+                startAudioPipeline();
+                startWatchdog();
+
+                updateStatus("LIVE: video + audio starting");
+                drainVideoEncoder();
+
+            } catch (Exception e) {
+                if (running && !stopping) {
+                    updateStatus(
+                            "Start error: "
+                                    + e.getClass().getSimpleName()
+                                    + " "
+                                    + safeMessage(e)
+                    );
+                }
+
+                stopStreaming();
+            }
+        });
+    }
+
+    private void acquireWakeLock() {
+        try {
+            PowerManager powerManager =
+                    (PowerManager) getSystemService(Context.POWER_SERVICE);
+
+            if (powerManager != null) {
+                wakeLock = powerManager.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK,
+                        "LiveScreen::StreamingWakeLock"
                 );
 
-        encoderHandler.post(
-                () -> {
+                wakeLock.setReferenceCounted(false);
 
-                    try {
-
-                        if (!connectVideoWithRetry()) {
-
-                            if (!stopping) {
-
-                                updateStatus(
-                                        "VPS video connection stopped"
-                                );
-                            }
-
-                            return;
-                        }
-
-                        if (
-                                !running
-                                        ||
-                                stopping
-                        ) {
-                            return;
-                        }
-
-                        updateStatus(
-                                "VPS video connected"
-                        );
-
-                        prepareVideoEncoder();
-
-                        prepareMediaProjection(
-                                resultCode,
-                                captureData
-                        );
-
-                        startAudioPipeline();
-
-                        updateStatus(
-                                "LIVE: video + audio starting"
-                        );
-
-                        drainVideoEncoder();
-
-                    } catch (Exception e) {
-
-                        if (
-                                running
-                                        &&
-                                !stopping
-                        ) {
-
-                            updateStatus(
-                                    "Start error: "
-                                            +
-                                            e.getClass()
-                                                    .getSimpleName()
-                                            +
-                                            " "
-                                            +
-                                            safeMessage(e)
-                            );
-                        }
-
-                        stopStreaming();
-                    }
+                if (!wakeLock.isHeld()) {
+                    wakeLock.acquire();
                 }
-        );
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void releaseWakeLock() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) {
+                wakeLock.release();
+            }
+        } catch (Exception ignored) {
+        }
+
+        wakeLock = null;
     }
 
     private boolean connectVideoWithRetry() {
 
         int attempt = 0;
 
-        while (
-                running
-                        &&
-                !stopping
-        ) {
+        while (running && !stopping) {
 
             attempt++;
 
             try {
-
-                updateStatus(
-                        "Connecting video VPS... "
-                                +
-                                attempt
-                );
-
+                updateStatus("Connecting video VPS... " + attempt);
                 connectVideoSocket();
-
                 return true;
 
             } catch (IOException e) {
-
                 closeVideoSocket();
 
-                if (
-                        !running
-                                ||
-                                stopping
-                ) {
+                if (!running || stopping) {
                     return false;
                 }
 
@@ -370,27 +278,17 @@ public class ScreenCaptureService extends Service {
         return false;
     }
 
-    private void connectVideoSocket()
-            throws IOException {
+    private void connectVideoSocket() throws IOException {
 
         closeVideoSocket();
 
-        Socket newSocket =
-                new Socket();
-
-        newSocket.setTcpNoDelay(
-                true
-        );
-
-        newSocket.setKeepAlive(
-                true
-        );
+        Socket newSocket = new Socket();
+        newSocket.setTcpNoDelay(true);
+        newSocket.setKeepAlive(true);
+        newSocket.setSendBufferSize(256 * 1024);
 
         newSocket.connect(
-                new InetSocketAddress(
-                        VPS_HOST,
-                        VIDEO_PORT
-                ),
+                new InetSocketAddress(VPS_HOST, VIDEO_PORT),
                 CONNECT_TIMEOUT_MS
         );
 
@@ -400,14 +298,10 @@ public class ScreenCaptureService extends Service {
                         256 * 1024
                 );
 
-        videoSocket =
-                newSocket;
-
-        videoOutput =
-                newOutput;
-
-        videoSocketConnected =
-                true;
+        videoSocket = newSocket;
+        videoOutput = newOutput;
+        videoSocketConnected = true;
+        lastVideoWriteAt = SystemClock.elapsedRealtime();
     }
 
     private boolean reconnectVideo() {
@@ -416,49 +310,27 @@ public class ScreenCaptureService extends Service {
 
         int attempt = 0;
 
-        while (
-                running
-                        &&
-                !stopping
-        ) {
+        while (running && !stopping) {
 
             attempt++;
-
-            updateStatus(
-                    "Reconnecting video... "
-                            +
-                            attempt
-            );
+            updateStatus("Reconnecting video... " + attempt);
 
             try {
-
                 connectVideoSocket();
-
                 sendCachedCodecSpecificData();
-
                 requestKeyFrame();
 
-                updateStatus(
-                        "Video reconnected ✓"
-                );
-
+                updateStatus("Video reconnected ✓");
                 return true;
 
             } catch (Exception e) {
-
                 closeVideoSocket();
 
-                if (
-                        !running
-                                ||
-                                stopping
-                ) {
-
+                if (!running || stopping) {
                     return false;
                 }
 
                 if (!waitBeforeReconnect()) {
-
                     return false;
                 }
             }
@@ -471,41 +343,25 @@ public class ScreenCaptureService extends Service {
 
         long end =
                 SystemClock.elapsedRealtime()
-                        +
-                        RECONNECT_DELAY_MS;
+                        + RECONNECT_DELAY_MS;
 
         while (
                 running
-                        &&
-                !stopping
-                        &&
-                SystemClock.elapsedRealtime()
-                        <
-                        end
+                        && !stopping
+                        && SystemClock.elapsedRealtime() < end
         ) {
-
             try {
-
-                Thread.sleep(
-                        200
-                );
-
+                Thread.sleep(200);
             } catch (InterruptedException e) {
-
-                Thread.currentThread()
-                        .interrupt();
-
+                Thread.currentThread().interrupt();
                 return false;
             }
         }
 
-        return running
-                &&
-                !stopping;
+        return running && !stopping;
     }
 
-    private void prepareVideoEncoder()
-            throws IOException {
+    private void prepareVideoEncoder() throws IOException {
 
         MediaFormat format =
                 MediaFormat.createVideoFormat(
@@ -516,42 +372,27 @@ public class ScreenCaptureService extends Service {
 
         format.setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo
-                        .CodecCapabilities
-                        .COLOR_FormatSurface
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
         );
 
-        format.setInteger(
-                MediaFormat.KEY_BIT_RATE,
-                BITRATE
-        );
+        format.setInteger(MediaFormat.KEY_BIT_RATE, BITRATE);
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, FPS);
+        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL);
 
-        format.setInteger(
-                MediaFormat.KEY_FRAME_RATE,
-                FPS
-        );
-
-        format.setInteger(
-                MediaFormat.KEY_I_FRAME_INTERVAL,
-                I_FRAME_INTERVAL
-        );
-
-        encoder =
+        videoEncoder =
                 MediaCodec.createEncoderByType(
                         MediaFormat.MIMETYPE_VIDEO_AVC
                 );
 
-        encoder.configure(
+        videoEncoder.configure(
                 format,
                 null,
                 null,
                 MediaCodec.CONFIGURE_FLAG_ENCODE
         );
 
-        encoderInputSurface =
-                encoder.createInputSurface();
-
-        encoder.start();
+        encoderInputSurface = videoEncoder.createInputSurface();
+        videoEncoder.start();
     }
 
     private void prepareMediaProjection(
@@ -561,43 +402,28 @@ public class ScreenCaptureService extends Service {
 
         MediaProjectionManager projectionManager =
                 (MediaProjectionManager)
-                        getSystemService(
-                                Context.MEDIA_PROJECTION_SERVICE
-                        );
+                        getSystemService(Context.MEDIA_PROJECTION_SERVICE);
 
         if (projectionManager == null) {
-
-            throw new RuntimeException(
-                    "MediaProjectionManager unavailable"
-            );
+            throw new RuntimeException("MediaProjectionManager unavailable");
         }
 
         mediaProjection =
-                projectionManager
-                        .getMediaProjection(
-                                resultCode,
-                                captureData
-                        );
+                projectionManager.getMediaProjection(
+                        resultCode,
+                        captureData
+                );
 
         if (mediaProjection == null) {
-
-            throw new RuntimeException(
-                    "MediaProjection failed"
-            );
+            throw new RuntimeException("MediaProjection failed");
         }
 
         mediaProjection.registerCallback(
                 new MediaProjection.Callback() {
-
                     @Override
                     public void onStop() {
-
                         if (!stopping) {
-
-                            updateStatus(
-                                    "Screen capture stopped"
-                            );
-
+                            updateStatus("Screen capture permission ended");
                             stopStreaming();
                         }
                     }
@@ -611,25 +437,66 @@ public class ScreenCaptureService extends Service {
                         .densityDpi;
 
         virtualDisplay =
-                mediaProjection
-                        .createVirtualDisplay(
-                                "LiveScreenCapture",
-                                WIDTH,
-                                HEIGHT,
-                                density,
-                                DisplayManager
-                                        .VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                                encoderInputSurface,
-                                null,
-                                encoderHandler
-                        );
+                mediaProjection.createVirtualDisplay(
+                        "LiveScreenCapture",
+                        WIDTH,
+                        HEIGHT,
+                        density,
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                        encoderInputSurface,
+                        null,
+                        encoderHandler
+                );
 
         if (virtualDisplay == null) {
-
-            throw new RuntimeException(
-                    "VirtualDisplay failed"
-            );
+            throw new RuntimeException("VirtualDisplay failed");
         }
+    }
+
+    private void startWatchdog() {
+
+        if (watchdogHandler == null) {
+            return;
+        }
+
+        watchdogHandler.postDelayed(
+                new Runnable() {
+                    @Override
+                    public void run() {
+
+                        if (!running || stopping) {
+                            return;
+                        }
+
+                        long now = SystemClock.elapsedRealtime();
+
+                        if (
+                                videoSocketConnected
+                                        && now - lastVideoWriteAt
+                                        > VIDEO_STALL_TIMEOUT_MS
+                        ) {
+                            updateStatus("Video stalled - reconnecting");
+                            closeVideoSocket();
+                            requestKeyFrame();
+                        }
+
+                        if (
+                                now - lastVideoFrameAt
+                                        > VIDEO_STALL_TIMEOUT_MS
+                        ) {
+                            requestKeyFrame();
+                        }
+
+                        if (running && !stopping && watchdogHandler != null) {
+                            watchdogHandler.postDelayed(
+                                    this,
+                                    WATCHDOG_INTERVAL_MS
+                            );
+                        }
+                    }
+                },
+                WATCHDOG_INTERVAL_MS
+        );
     }
 
     private void startAudioPipeline() {
@@ -646,22 +513,14 @@ public class ScreenCaptureService extends Service {
     private void runAudioPipeline() {
 
         try {
-
-            audioRecord =
-                    createAudioRecord();
+            audioRecord = createAudioRecord();
 
             if (
                     audioRecord == null
-                            ||
-                    audioRecord.getState()
-                            !=
-                    AudioRecord.STATE_INITIALIZED
+                            || audioRecord.getState()
+                            != AudioRecord.STATE_INITIALIZED
             ) {
-
-                updateStatus(
-                        "Video live; audio unavailable"
-                );
-
+                updateStatus("Video live; audio unavailable");
                 return;
             }
 
@@ -700,22 +559,14 @@ public class ScreenCaptureService extends Service {
             );
 
             audioEncoder.start();
-
             audioRecord.startRecording();
 
             connectAudioWithRetry();
 
-            byte[] pcm =
-                    new byte[8192];
+            byte[] pcm = new byte[8192];
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
 
-            MediaCodec.BufferInfo info =
-                    new MediaCodec.BufferInfo();
-
-            while (
-                    running
-                            &&
-                    !stopping
-            ) {
+            while (running && !stopping) {
 
                 int read =
                         audioRecord.read(
@@ -739,18 +590,12 @@ public class ScreenCaptureService extends Service {
                                 );
 
                         if (input != null) {
-
                             input.clear();
-                            input.put(
-                                    pcm,
-                                    0,
-                                    read
-                            );
+                            input.put(pcm, 0, read);
 
                             long pts =
                                     System.nanoTime()
-                                            /
-                                    1000L;
+                                            / 1000L;
 
                             audioEncoder.queueInputBuffer(
                                     inputIndex,
@@ -763,37 +608,34 @@ public class ScreenCaptureService extends Service {
                     }
                 }
 
-                drainAudioEncoder(
-                        info
-                );
+                drainAudioEncoder(info);
             }
 
         } catch (Exception e) {
-
-            if (
-                    running
-                            &&
-                    !stopping
-            ) {
-
+            if (running && !stopping) {
                 updateStatus(
-                        "Video live; audio error: "
-                                +
-                                e.getClass()
-                                        .getSimpleName()
+                        "Video live; audio restarting"
                 );
+
+                if (running && !stopping) {
+                    sleepQuietly(1500);
+                    if (running && !stopping) {
+                        releaseAudio();
+                        startAudioPipeline();
+                    }
+                }
             }
 
         } finally {
-
-            releaseAudio();
+            if (Thread.currentThread() == audioThread) {
+                releaseAudio();
+            }
         }
     }
 
     private AudioRecord createAudioRecord() {
 
-        int channelMask =
-                AudioFormat.CHANNEL_IN_STEREO;
+        int channelMask = AudioFormat.CHANNEL_IN_STEREO;
 
         int minBuffer =
                 AudioRecord.getMinBufferSize(
@@ -809,20 +651,14 @@ public class ScreenCaptureService extends Service {
                 );
 
         if (
-                Build.VERSION.SDK_INT
-                        >=
-                Build.VERSION_CODES.Q
-                        &&
-                mediaProjection != null
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                        && mediaProjection != null
         ) {
-
             try {
-
-                AudioPlaybackCaptureConfiguration config =
-                        new AudioPlaybackCaptureConfiguration
-                                .Builder(
-                                        mediaProjection
-                                )
+                AudioPlaybackCaptureConfiguration configuration =
+                        new AudioPlaybackCaptureConfiguration.Builder(
+                                mediaProjection
+                        )
                                 .addMatchingUsage(
                                         AudioAttributes.USAGE_MEDIA
                                 )
@@ -832,8 +668,7 @@ public class ScreenCaptureService extends Service {
                                 .build();
 
                 AudioFormat format =
-                        new AudioFormat
-                                .Builder()
+                        new AudioFormat.Builder()
                                 .setEncoding(
                                         AudioFormat.ENCODING_PCM_16BIT
                                 )
@@ -841,46 +676,34 @@ public class ScreenCaptureService extends Service {
                                         AUDIO_SAMPLE_RATE
                                 )
                                 .setChannelMask(
-                                        channelMask
+                                        AudioFormat.CHANNEL_IN_STEREO
                                 )
                                 .build();
 
-                AudioRecord playbackRecord =
-                        new AudioRecord
-                                .Builder()
-                                .setAudioFormat(
-                                        format
-                                )
-                                .setBufferSizeInBytes(
-                                        bufferSize
-                                )
+                AudioRecord internalAudio =
+                        new AudioRecord.Builder()
                                 .setAudioPlaybackCaptureConfig(
-                                        config
+                                        configuration
                                 )
+                                .setAudioFormat(format)
+                                .setBufferSizeInBytes(bufferSize)
                                 .build();
 
                 if (
-                        playbackRecord.getState()
-                                ==
-                        AudioRecord.STATE_INITIALIZED
+                        internalAudio.getState()
+                                == AudioRecord.STATE_INITIALIZED
                 ) {
-
-                    updateStatus(
-                            "Audio: internal playback capture"
-                    );
-
-                    return playbackRecord;
+                    return internalAudio;
                 }
 
-                playbackRecord.release();
+                internalAudio.release();
 
             } catch (Exception ignored) {
             }
         }
 
         try {
-
-            AudioRecord micRecord =
+            AudioRecord mic =
                     new AudioRecord(
                             MediaRecorder.AudioSource.MIC,
                             AUDIO_SAMPLE_RATE,
@@ -890,19 +713,13 @@ public class ScreenCaptureService extends Service {
                     );
 
             if (
-                    micRecord.getState()
-                            ==
-                    AudioRecord.STATE_INITIALIZED
+                    mic.getState()
+                            == AudioRecord.STATE_INITIALIZED
             ) {
-
-                updateStatus(
-                        "Audio: microphone fallback"
-                );
-
-                return micRecord;
+                return mic;
             }
 
-            micRecord.release();
+            mic.release();
 
         } catch (Exception ignored) {
         }
@@ -912,15 +729,13 @@ public class ScreenCaptureService extends Service {
 
     private void drainAudioEncoder(
             MediaCodec.BufferInfo info
-    ) throws IOException {
+    ) {
 
-        while (
-                running
-                        &&
-                !stopping
-                        &&
-                audioEncoder != null
-        ) {
+        if (audioEncoder == null) {
+            return;
+        }
+
+        while (running && !stopping) {
 
             int outputIndex =
                     audioEncoder.dequeueOutputBuffer(
@@ -928,91 +743,55 @@ public class ScreenCaptureService extends Service {
                             0
                     );
 
-            if (
-                    outputIndex
-                            ==
-                    MediaCodec.INFO_TRY_AGAIN_LATER
-            ) {
-
+            if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 return;
             }
 
-            if (
-                    outputIndex
-                            ==
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED
-            ) {
-
+            if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 continue;
             }
 
             if (outputIndex < 0) {
-
                 return;
             }
 
+            ByteBuffer output =
+                    audioEncoder.getOutputBuffer(
+                            outputIndex
+                    );
+
             try {
-
-                ByteBuffer output =
-                        audioEncoder.getOutputBuffer(
-                                outputIndex
-                        );
-
                 if (
-                        output == null
-                                ||
-                        info.size <= 0
-                ) {
-
-                    continue;
-                }
-
-                if (
-                        (
+                        output != null
+                                && info.size > 0
+                                && (
                                 info.flags
-                                        &
-                                MediaCodec.BUFFER_FLAG_CODEC_CONFIG
-                        )
-                                != 0
+                                        & MediaCodec.BUFFER_FLAG_CODEC_CONFIG
+                        ) == 0
                 ) {
+                    output.position(info.offset);
+                    output.limit(info.offset + info.size);
 
-                    continue;
+                    byte[] aac =
+                            new byte[
+                                    info.size + 7
+                                    ];
+
+                    addAdtsHeader(
+                            aac,
+                            aac.length
+                    );
+
+                    output.get(
+                            aac,
+                            7,
+                            info.size
+                    );
+
+                    sendAudioData(aac);
                 }
-
-                output.position(
-                        info.offset
-                );
-
-                output.limit(
-                        info.offset
-                                +
-                                info.size
-                );
-
-                byte[] aac =
-                        new byte[
-                                info.size
-                                +
-                                7
-                                ];
-
-                addAdtsHeader(
-                        aac,
-                        aac.length
-                );
-
-                output.get(
-                        aac,
-                        7,
-                        info.size
-                );
-
-                sendAudioData(
-                        aac
-                );
 
             } finally {
-
                 audioEncoder.releaseOutputBuffer(
                         outputIndex,
                         false
@@ -1032,66 +811,47 @@ public class ScreenCaptureService extends Service {
 
         packet[0] = (byte) 0xFF;
         packet[1] = (byte) 0xF1;
+
         packet[2] =
                 (byte) (
                         ((profile - 1) << 6)
-                                |
-                        (frequencyIndex << 2)
-                                |
-                        (channelConfig >> 2)
+                                | (frequencyIndex << 2)
+                                | (channelConfig >> 2)
                 );
 
         packet[3] =
                 (byte) (
                         ((channelConfig & 3) << 6)
-                                |
-                        (packetLength >> 11)
+                                | (packetLength >> 11)
                 );
 
         packet[4] =
                 (byte) (
-                        (packetLength & 0x7FF)
-                                >>
-                        3
+                        (packetLength & 0x7FF) >> 3
                 );
 
         packet[5] =
                 (byte) (
-                        (
-                                (packetLength & 7)
-                                        <<
-                                5
-                        )
-                                |
-                        0x1F
+                        ((packetLength & 7) << 5)
+                                | 0x1F
                 );
 
-        packet[6] =
-                (byte) 0xFC;
+        packet[6] = (byte) 0xFC;
     }
 
     private void connectAudioWithRetry() {
 
         while (
                 running
-                        &&
-                !stopping
-                        &&
-                !audioSocketConnected
+                        && !stopping
+                        && !audioSocketConnected
         ) {
-
             try {
-
                 connectAudioSocket();
-
-                updateStatus(
-                        "LIVE: video + audio connected"
-                );
-
+                updateStatus("LIVE: video + audio connected");
                 return;
 
             } catch (IOException e) {
-
                 closeAudioSocket();
 
                 if (!waitBeforeReconnect()) {
@@ -1101,21 +861,14 @@ public class ScreenCaptureService extends Service {
         }
     }
 
-    private void connectAudioSocket()
-            throws IOException {
+    private void connectAudioSocket() throws IOException {
 
         closeAudioSocket();
 
-        Socket newSocket =
-                new Socket();
-
-        newSocket.setTcpNoDelay(
-                true
-        );
-
-        newSocket.setKeepAlive(
-                true
-        );
+        Socket newSocket = new Socket();
+        newSocket.setTcpNoDelay(true);
+        newSocket.setKeepAlive(true);
+        newSocket.setSendBufferSize(128 * 1024);
 
         newSocket.connect(
                 new InetSocketAddress(
@@ -1131,58 +884,42 @@ public class ScreenCaptureService extends Service {
                         128 * 1024
                 );
 
-        audioSocket =
-                newSocket;
-
-        audioOutput =
-                newOutput;
-
-        audioSocketConnected =
-                true;
+        audioSocket = newSocket;
+        audioOutput = newOutput;
+        audioSocketConnected = true;
+        lastAudioWriteAt = SystemClock.elapsedRealtime();
     }
 
-    private void sendAudioData(
-            byte[] data
-    ) {
+    private void sendAudioData(byte[] data) {
 
-        if (
-                !running
-                        ||
-                stopping
-        ) {
-
+        if (!running || stopping) {
             return;
         }
 
         try {
-
             if (
                     !audioSocketConnected
-                            ||
-                    audioOutput == null
+                            || audioOutput == null
             ) {
-
                 connectAudioWithRetry();
             }
 
             if (
                     audioSocketConnected
-                            &&
-                    audioOutput != null
+                            && audioOutput != null
             ) {
-
-                audioOutput.write(
-                        data
-                );
-
+                audioOutput.write(data);
                 audioOutput.flush();
+                lastAudioWriteAt =
+                        SystemClock.elapsedRealtime();
             }
 
         } catch (IOException e) {
-
             closeAudioSocket();
 
-            connectAudioWithRetry();
+            if (running && !stopping) {
+                connectAudioWithRetry();
+            }
         }
     }
 
@@ -1193,55 +930,42 @@ public class ScreenCaptureService extends Service {
 
         while (
                 running
-                        &&
-                !stopping
-                        &&
-                encoder != null
+                        && !stopping
+                        && videoEncoder != null
         ) {
 
-            int outputIndex =
-                    -1;
+            int outputIndex = -1;
 
             try {
-
                 outputIndex =
-                        encoder.dequeueOutputBuffer(
+                        videoEncoder.dequeueOutputBuffer(
                                 info,
-                                10_000
+                                10000
                         );
 
                 if (
                         outputIndex
-                                ==
-                        MediaCodec.INFO_TRY_AGAIN_LATER
+                                == MediaCodec.INFO_TRY_AGAIN_LATER
                 ) {
-
                     continue;
                 }
 
                 if (
                         outputIndex
-                                ==
-                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED
+                                == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED
                 ) {
-
                     MediaFormat outputFormat =
-                            encoder.getOutputFormat();
+                            videoEncoder.getOutputFormat();
 
                     cacheCodecSpecificData(
                             outputFormat
                     );
 
                     try {
-
                         sendCachedCodecSpecificData();
-
-                        updateStatus(
-                                "H264 ready - sending"
-                        );
+                        updateStatus("H264 ready - sending");
 
                     } catch (IOException e) {
-
                         if (!reconnectVideo()) {
                             return;
                         }
@@ -1251,137 +975,93 @@ public class ScreenCaptureService extends Service {
                 }
 
                 if (outputIndex < 0) {
-
                     continue;
                 }
 
                 ByteBuffer buffer =
-                        encoder.getOutputBuffer(
+                        videoEncoder.getOutputBuffer(
                                 outputIndex
                         );
 
                 if (
                         buffer != null
-                                &&
-                        info.size > 0
+                                && info.size > 0
                 ) {
+                    lastVideoFrameAt =
+                            SystemClock.elapsedRealtime();
 
-                    buffer.position(
-                            info.offset
-                    );
-
-                    buffer.limit(
-                            info.offset
-                                    +
-                                    info.size
-                    );
+                    buffer.position(info.offset);
+                    buffer.limit(info.offset + info.size);
 
                     byte[] data =
-                            new byte[
-                                    info.size
-                                    ];
+                            new byte[info.size];
 
-                    buffer.get(
-                            data
-                    );
+                    buffer.get(data);
 
-                    boolean sent =
-                            false;
+                    boolean sent = false;
 
                     try {
-
-                        sendVideoData(
-                                data
-                        );
-
-                        sent =
-                                true;
+                        sendVideoData(data);
+                        sent = true;
 
                     } catch (IOException e) {
-
                         if (!reconnectVideo()) {
-
                             return;
+                        }
+
+                        try {
+                            sendVideoData(data);
+                            sent = true;
+                        } catch (IOException ignored) {
                         }
                     }
 
                     if (sent) {
-
                         frameCount++;
 
                         boolean keyFrame =
                                 (
                                         info.flags
-                                                &
-                                        MediaCodec
-                                                .BUFFER_FLAG_KEY_FRAME
-                                )
-                                        != 0;
+                                                & MediaCodec.BUFFER_FLAG_KEY_FRAME
+                                ) != 0;
 
-                        if (keyFrame) {
-
+                        if (keyFrame || frameCount % 150 == 0) {
                             updateStatus(
                                     audioSocketConnected
-                                            ?
-                                            "LIVE ✓ video + audio"
-                                            :
-                                            "LIVE ✓ video; audio reconnecting"
-                            );
-
-                        } else if (
-                                frameCount % 150 == 0
-                        ) {
-
-                            updateStatus(
-                                    audioSocketConnected
-                                            ?
-                                            "LIVE ✓ video + audio"
-                                            :
-                                            "LIVE ✓ video"
+                                            ? "LIVE ✓ video + audio"
+                                            : "LIVE ✓ video; audio reconnecting"
                             );
                         }
                     }
                 }
 
             } catch (Exception e) {
-
-                if (
-                        running
-                                &&
-                        !stopping
-                ) {
-
+                if (running && !stopping) {
                     updateStatus(
-                            "Video encoder error: "
-                                    +
-                                    e.getClass()
-                                            .getSimpleName()
-                                    +
-                                    " "
-                                    +
-                                    safeMessage(e)
+                            "Video pipeline recovering: "
+                                    + e.getClass().getSimpleName()
                     );
+
+                    closeVideoSocket();
+
+                    if (reconnectVideo()) {
+                        continue;
+                    }
                 }
 
                 stopStreaming();
-
                 return;
 
             } finally {
-
                 if (
                         outputIndex >= 0
-                                &&
-                        encoder != null
+                                && videoEncoder != null
                 ) {
-
                     try {
-
-                        encoder.releaseOutputBuffer(
+                        videoEncoder.releaseOutputBuffer(
                                 outputIndex,
                                 false
                         );
-
                     } catch (Exception ignored) {
                     }
                 }
@@ -1395,16 +1075,12 @@ public class ScreenCaptureService extends Service {
 
         cachedCsd0 =
                 copyByteBuffer(
-                        format.getByteBuffer(
-                                "csd-0"
-                        )
+                        format.getByteBuffer("csd-0")
                 );
 
         cachedCsd1 =
                 copyByteBuffer(
-                        format.getByteBuffer(
-                                "csd-1"
-                        )
+                        format.getByteBuffer("csd-1")
                 );
     }
 
@@ -1420,14 +1096,9 @@ public class ScreenCaptureService extends Service {
                 source.duplicate();
 
         byte[] bytes =
-                new byte[
-                        copy.remaining()
-                        ];
+                new byte[copy.remaining()];
 
-        copy.get(
-                bytes
-        );
-
+        copy.get(bytes);
         return bytes;
     }
 
@@ -1436,51 +1107,38 @@ public class ScreenCaptureService extends Service {
 
         if (
                 cachedCsd0 != null
-                        &&
-                        cachedCsd0.length > 0
+                        && cachedCsd0.length > 0
         ) {
-
-            sendVideoData(
-                    cachedCsd0
-            );
+            sendVideoData(cachedCsd0);
         }
 
         if (
                 cachedCsd1 != null
-                        &&
-                        cachedCsd1.length > 0
+                        && cachedCsd1.length > 0
         ) {
-
-            sendVideoData(
-                    cachedCsd1
-            );
+            sendVideoData(cachedCsd1);
         }
 
         if (videoOutput != null) {
-
             videoOutput.flush();
         }
     }
 
     private void requestKeyFrame() {
 
-        if (encoder == null) {
+        if (videoEncoder == null) {
             return;
         }
 
         try {
-
-            Bundle params =
-                    new Bundle();
+            Bundle params = new Bundle();
 
             params.putInt(
                     MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME,
                     0
             );
 
-            encoder.setParameters(
-                    params
-            );
+            videoEncoder.setParameters(params);
 
         } catch (Exception ignored) {
         }
@@ -1492,97 +1150,63 @@ public class ScreenCaptureService extends Service {
 
         if (
                 !videoSocketConnected
-                        ||
-                videoOutput == null
+                        || videoOutput == null
         ) {
-
             throw new IOException(
                     "VPS video socket disconnected"
             );
         }
 
-        videoOutput.write(
-                data
-        );
-
+        videoOutput.write(data);
         videoOutput.flush();
+
+        lastVideoWriteAt =
+                SystemClock.elapsedRealtime();
     }
 
     private synchronized void closeVideoSocket() {
 
-        videoSocketConnected =
-                false;
+        videoSocketConnected = false;
 
         if (videoOutput != null) {
-
             try {
-
-                videoOutput.flush();
-
-            } catch (Exception ignored) {
-            }
-
-            try {
-
                 videoOutput.close();
-
             } catch (Exception ignored) {
             }
 
-            videoOutput =
-                    null;
+            videoOutput = null;
         }
 
         if (videoSocket != null) {
-
             try {
-
                 videoSocket.close();
-
             } catch (Exception ignored) {
             }
 
-            videoSocket =
-                    null;
+            videoSocket = null;
         }
     }
 
     private synchronized void closeAudioSocket() {
 
-        audioSocketConnected =
-                false;
+        audioSocketConnected = false;
 
         if (audioOutput != null) {
-
             try {
-
-                audioOutput.flush();
-
-            } catch (Exception ignored) {
-            }
-
-            try {
-
                 audioOutput.close();
-
             } catch (Exception ignored) {
             }
 
-            audioOutput =
-                    null;
+            audioOutput = null;
         }
 
         if (audioSocket != null) {
-
             try {
-
                 audioSocket.close();
-
             } catch (Exception ignored) {
             }
 
-            audioSocket =
-                    null;
+            audioSocket = null;
         }
     }
 
@@ -1592,97 +1216,74 @@ public class ScreenCaptureService extends Service {
             return;
         }
 
-        stopping =
-                true;
+        stopping = true;
+        running = false;
 
-        running =
-                false;
+        updateStatus("Stopping...");
 
-        updateStatus(
-                "Stopping..."
-        );
+        if (watchdogHandler != null) {
+            watchdogHandler.removeCallbacksAndMessages(null);
+        }
 
         closeVideoSocket();
         closeAudioSocket();
 
         if (audioRecord != null) {
-
             try {
-
                 audioRecord.stop();
-
             } catch (Exception ignored) {
             }
         }
 
         if (audioThread != null) {
-
             try {
-
                 audioThread.interrupt();
-
             } catch (Exception ignored) {
             }
         }
 
         if (encoderHandler != null) {
-
-            encoderHandler.post(
-                    this::releaseEverything
-            );
-
+            encoderHandler.post(this::releaseEverything);
         } else {
-
             releaseEverything();
         }
     }
 
-    private void releaseAudio() {
+    private synchronized void releaseAudio() {
 
         closeAudioSocket();
 
         if (audioRecord != null) {
-
             try {
-
                 audioRecord.stop();
-
             } catch (Exception ignored) {
             }
 
             try {
-
                 audioRecord.release();
-
             } catch (Exception ignored) {
             }
 
-            audioRecord =
-                    null;
+            audioRecord = null;
         }
 
         if (audioEncoder != null) {
-
             try {
-
                 audioEncoder.stop();
-
             } catch (Exception ignored) {
             }
 
             try {
-
                 audioEncoder.release();
-
             } catch (Exception ignored) {
             }
 
-            audioEncoder =
-                    null;
+            audioEncoder = null;
         }
 
-        audioThread =
-                null;
+        if (Thread.currentThread() == audioThread) {
+            audioThread = null;
+        }
     }
 
     private void releaseEverything() {
@@ -1691,149 +1292,107 @@ public class ScreenCaptureService extends Service {
         closeAudioSocket();
 
         if (virtualDisplay != null) {
-
             try {
-
                 virtualDisplay.release();
-
             } catch (Exception ignored) {
             }
 
-            virtualDisplay =
-                    null;
+            virtualDisplay = null;
         }
 
         if (mediaProjection != null) {
-
             try {
-
                 mediaProjection.stop();
-
             } catch (Exception ignored) {
             }
 
-            mediaProjection =
-                    null;
+            mediaProjection = null;
         }
 
-        if (encoder != null) {
-
+        if (videoEncoder != null) {
             try {
-
-                encoder.stop();
-
+                videoEncoder.stop();
             } catch (Exception ignored) {
             }
 
             try {
-
-                encoder.release();
-
+                videoEncoder.release();
             } catch (Exception ignored) {
             }
 
-            encoder =
-                    null;
+            videoEncoder = null;
         }
 
         if (encoderInputSurface != null) {
-
             try {
-
                 encoderInputSurface.release();
-
             } catch (Exception ignored) {
             }
 
-            encoderInputSurface =
-                    null;
+            encoderInputSurface = null;
         }
 
-        cachedCsd0 =
-                null;
+        cachedCsd0 = null;
+        cachedCsd1 = null;
 
-        cachedCsd1 =
-                null;
+        releaseWakeLock();
 
-        updateStatus(
-                "Stopped"
-        );
+        updateStatus("Stopped");
 
-        stopForeground(
-                true
-        );
-
+        stopForeground(true);
         stopSelf();
 
         if (encoderThread != null) {
-
             try {
-
                 encoderThread.quitSafely();
-
             } catch (Exception ignored) {
             }
 
-            encoderThread =
-                    null;
+            encoderThread = null;
         }
 
-        encoderHandler =
-                null;
-
-        stopping =
-                false;
+        encoderHandler = null;
+        watchdogHandler = null;
+        stopping = false;
     }
 
-    private String safeMessage(
-            Exception e
-    ) {
-
-        String message =
-                e.getMessage();
-
-        if (message == null) {
-
-            return "";
+    private void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
-
-        return message;
     }
 
-    private void updateStatus(
-            String status
-    ) {
+    private String safeMessage(Exception e) {
+        String message = e.getMessage();
+        return message == null ? "" : message;
+    }
+
+    private void updateStatus(String status) {
 
         getSharedPreferences(
                 "live_screen",
                 MODE_PRIVATE
         )
                 .edit()
-                .putString(
-                        "status",
-                        status
-                )
+                .putString("status", status)
                 .apply();
 
-        updateNotification(
-                status
-        );
+        updateNotification(status);
     }
 
     private void createNotificationChannel() {
 
         if (
                 Build.VERSION.SDK_INT
-                        >=
-                Build.VERSION_CODES.O
+                        >= Build.VERSION_CODES.O
         ) {
-
             NotificationChannel channel =
                     new NotificationChannel(
                             CHANNEL_ID,
                             "Live Screen Sharing",
-                            NotificationManager
-                                    .IMPORTANCE_LOW
+                            NotificationManager.IMPORTANCE_LOW
                     );
 
             NotificationManager manager =
@@ -1842,7 +1401,6 @@ public class ScreenCaptureService extends Service {
                     );
 
             if (manager != null) {
-
                 manager.createNotificationChannel(
                         channel
                 );
@@ -1854,27 +1412,19 @@ public class ScreenCaptureService extends Service {
             String text
     ) {
 
-        return new NotificationCompat
-                .Builder(
-                        this,
-                        CHANNEL_ID
-                )
+        return new NotificationCompat.Builder(
+                this,
+                CHANNEL_ID
+        )
                 .setContentTitle(
                         "SarahMatches Live Screen"
                 )
-                .setContentText(
-                        text
-                )
+                .setContentText(text)
                 .setSmallIcon(
-                        android.R.drawable
-                                .presence_video_online
+                        android.R.drawable.presence_video_online
                 )
-                .setOngoing(
-                        true
-                )
-                .setOnlyAlertOnce(
-                        true
-                )
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
                 .build();
     }
 
@@ -1883,7 +1433,6 @@ public class ScreenCaptureService extends Service {
     ) {
 
         try {
-
             NotificationManager manager =
                     (NotificationManager)
                             getSystemService(
@@ -1891,38 +1440,28 @@ public class ScreenCaptureService extends Service {
                             );
 
             if (manager != null) {
-
                 manager.notify(
                         NOTIFICATION_ID,
-                        buildNotification(
-                                text
-                        )
+                        buildNotification(text)
                 );
             }
-
         } catch (Exception ignored) {
         }
     }
 
     @Nullable
     @Override
-    public IBinder onBind(
-            Intent intent
-    ) {
-
+    public IBinder onBind(Intent intent) {
         return null;
     }
 
     @Override
     public void onDestroy() {
 
-        if (
-                running
-                        &&
-                !stopping
-        ) {
-
+        if (running && !stopping) {
             stopStreaming();
+        } else {
+            releaseWakeLock();
         }
 
         super.onDestroy();
